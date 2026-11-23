@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Print a compact summary of one Docker container."""
+
+import argparse
+import json
+import subprocess
+import sys
+
+
+def rows(container):
+    config = container["HostConfig"]
+    network = container["NetworkSettings"]
+    yield "Container", "{}  ({}, {})".format(
+        container["Name"].lstrip("/"), container["Config"]["Image"], container["State"]["Status"]
+    )
+    mode = config["NetworkMode"]
+    networks = network.get("Networks") or {}
+    for name, endpoint in sorted(networks.items()):
+        addresses = [endpoint.get(key) for key in ("IPAddress", "GlobalIPv6Address")]
+        yield "Network", "  ".join([name] + [ip for ip in addresses if ip])
+    if not networks:
+        yield "Network mode", mode or "default"
+
+    mounts = container.get("Mounts") or []
+    for mount in mounts:
+        source = mount.get("Name") or mount.get("Source") or mount["Type"]
+        access = "read/write" if mount["RW"] else "read-only"
+        yield "Mount", f"{source} -> {mount['Destination']}  ({mount['Type']}, {access})"
+    if not mounts:
+        yield "Mount", "none"
+
+    cpu = config.get("NanoCpus") or 0
+    quota = config.get("CpuQuota") or 0
+    cores = cpu / 1e9 if cpu else quota / (config.get("CpuPeriod") or 100000)
+    yield "CPU limit", f"{cores:g} CPUs" if cores > 0 else "no explicit quota"
+    if config.get("CpusetCpus"):
+        yield "Allowed CPUs", config["CpusetCpus"]
+    memory = config.get("Memory") or 0
+    yield "Memory limit", f"{memory / 2**20:g} MiB" if memory else "no explicit limit"
+
+    bindings = network.get("Ports") or {}
+    published = []
+    for target, entries in sorted(bindings.items()):
+        for entry in entries or []:
+            address = entry.get("HostIp") or "*"
+            if ":" in address:
+                address = f"[{address}]"
+            port = entry.get("HostPort")
+            value = f"{address}:{port} -> {target}" if port else f"{address} -> {target} (routed)"
+            published.append(value)
+    if mode == "host":
+        yield "Published ports", "host networking (shared network stack)"
+    elif mode.startswith("container:"):
+        yield "Published ports", f"shares network stack with {mode[10:22]}"
+    else:
+        for value in published or ["none active"]:
+            yield "Published ports", value
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("container", help="container name or ID")
+    parser.add_argument("--stats", action="store_true", help="include a current CPU and memory sample")
+    args = parser.parse_args()
+    data = subprocess.check_output(["docker", "container", "inspect", "--", args.container])
+    container = json.loads(data)[0]
+    details = list(rows(container))
+    if args.stats:
+        usage = "unavailable (container is {})".format(container["State"]["Status"])
+        if container["State"]["Status"] == "running":
+            sample = subprocess.run(
+                ["docker", "stats", "--no-stream", "--format", "CPU {{.CPUPerc}}  |  RAM {{.MemUsage}}",
+                 "--", container["Id"]], stdout=subprocess.PIPE, text=True,
+            )
+            usage = sample.stdout.strip() if sample.returncode == 0 else ""
+            usage = usage or "sample unavailable"
+        details.append(("Current usage", usage))
+    if sys.platform == "darwin":
+        try:
+            firewall = subprocess.check_output(
+                ["/usr/libexec/ApplicationFirewall/socketfilterfw", "--getglobalstate"],
+                stderr=subprocess.DEVNULL, text=True,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError):
+            firewall = "status unavailable"
+        details.append(("This Mac's app firewall", firewall))
+    width = max(len(label) for label, _ in details)
+    for label, value in details:
+        print(f"{label:<{width}}  {value}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except subprocess.CalledProcessError as error:
+        sys.exit(error.returncode)
+    except FileNotFoundError as error:
+        sys.exit(f"dockpeek: command unavailable: {error.filename}")

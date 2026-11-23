@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""Inspect a container's connections, storage, resources, and exposure in one snapshot."""
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import unicodedata
+
+VERSION = "0.1.2"
+SECTIONS = ("network", "storage", "resources", "access")
+METADATA = dict(SchemaVersion="0.1.0", Vendor="Shivansh Sukhija", Version=VERSION,
+                ShortDescription="Inspect a container in one compact snapshot")
+
+
+def plugin_args(argv):
+    # Docker forwards its original argv, including any global connection flags.
+    index = 0
+    with_value = {"--config", "--context", "-c", "--host", "-H", "--log-level",
+                  "-l", "--tlscacert", "--tlscert", "--tlskey"}
+    while index < len(argv) and argv[index].startswith("-"):
+        index += 2 if argv[index] in with_value else 1
+    if index < len(argv) and argv[index] == "lazy":
+        return argv[:index], argv[index + 1:]
+    return [], argv
+
+
+def size(n):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return f"{n:g} {unit}"
+        n /= 1024
+
+
+def network_rows(container):
+    network = container["NetworkSettings"]
+    rows = []
+    for name, endpoint in sorted((network.get("Networks") or {}).items()):
+        endpoint = endpoint or {}
+        addresses = []
+        for field, prefix in [("IPAddress", "IPPrefixLen"), ("GlobalIPv6Address", "GlobalIPv6PrefixLen")]:
+            if endpoint.get(field):
+                suffix = f"/{endpoint[prefix]}" if endpoint.get(prefix) else ""
+                addresses.append(endpoint[field] + suffix)
+        gateways = [endpoint[k] for k in ("Gateway", "IPv6Gateway") if endpoint.get(k)]
+        parts = addresses
+        if gateways:
+            parts.append("gateway " + ", ".join(gateways))
+        rows.append(("Network", name, "  ".join(parts)))
+    return rows or [("Network mode", container["HostConfig"].get("NetworkMode") or "default")]
+
+
+def storage_rows(container):
+    rows = []
+    for mount in container.get("Mounts") or []:
+        source = mount.get("Name") or mount.get("Source") or mount["Type"]
+        access = "read/write" if mount.get("RW") else "read-only"
+        rows.append(("Mount", f"{source} -> {mount['Destination']}", f"({mount['Type']}, {access})"))
+    return rows or [("Mounts", "none")]
+
+
+def resource_snapshot(container, docker, fast):
+    host = container["HostConfig"]
+    cpu = (host.get("NanoCpus") or 0) / 1e9
+    if not cpu and (host.get("CpuQuota") or 0) > 0:
+        cpu = host["CpuQuota"] / (host.get("CpuPeriod") or 100000)
+    memory = host.get("Memory") or 0
+    snapshot = dict(cpu=f"{cpu:g} cores" if cpu else None,
+                    memory=size(memory) if memory else None,
+                    cpuset=host.get("CpusetCpus"), pids=host.get("PidsLimit"),
+                    sample=None, message=None)
+    state = container["State"]["Status"]
+    if fast:
+        return snapshot
+    if state != "running":
+        snapshot["message"] = f"unavailable ({state})"
+        return snapshot
+    try:
+        result = subprocess.run(docker + ["stats", "--no-stream", "--format", "{{json .}}",
+                                          "--", container["Id"]], capture_output=True, text=True,
+                                timeout=8, check=True)
+        data = json.loads(result.stdout)
+        snapshot["sample"] = (data["CPUPerc"], data["MemUsage"].split("/")[0].strip(), data["PIDs"])
+    except subprocess.TimeoutExpired:
+        snapshot["message"] = "sample timed out"
+    except (subprocess.CalledProcessError, KeyError, ValueError):
+        snapshot["message"] = "sample unavailable"
+    return snapshot
+
+
+def resource_rows(snapshot):
+    limits = ["CPU " + (snapshot["cpu"] or "uncapped"), "RAM " + (snapshot["memory"] or "uncapped")]
+    if snapshot["cpuset"]:
+        limits.append(f"CPUs allowed {snapshot['cpuset']}")
+    if (snapshot["pids"] or 0) > 0:
+        limits.append(f"{snapshot['pids']} PIDs")
+    rows = [("Limits", "  |  ".join(limits))]
+    if snapshot["sample"]:
+        cpu, memory, pids = snapshot["sample"]
+        rows.append(("Usage", f"CPU {cpu}  |  RAM {memory}  |  PIDs {pids}"))
+    elif snapshot["message"]:
+        rows.append(("Usage", snapshot["message"]))
+    return rows
+
+
+def binding(entry, target):
+    addr = entry.get("HostIp") or ""
+    port = entry.get("HostPort")
+    ip = ipaddress.ip_address(addr) if addr else None
+    if not port:
+        return f"{target}  (direct routing, {addr or 'default address'})"
+    if ip and ip.is_loopback:
+        scope = "loopback"
+    elif ip and ip.is_unspecified:
+        scope = "all IPv4 interfaces" if ip.version == 4 else "all IPv6 interfaces"
+    else:
+        scope = "selected interface" if ip else "default bind address"
+    display = f"[{addr}]" if ":" in addr else addr or "*"
+    return f"{display}:{port} -> {target}  ({scope})"
+
+
+def access_rows(container):
+    mode = container["HostConfig"].get("NetworkMode") or ""
+    ports = container["NetworkSettings"].get("Ports") or {}
+    published = [("Published", binding(entry, target))
+                 for target, entries in sorted(ports.items()) for entry in entries or []]
+    if mode == "host":
+        published = [("Port access", "host networking (shared network stack)")]
+    elif mode.startswith("container:"):
+        published = [("Port access", "shares network stack with " + mode.split(":", 1)[1])]
+    rows = published or [("Published", "none active")]
+    exposed = set(container["Config"].get("ExposedPorts") or {}) | set(ports)
+    unpublished = sorted(p for p in exposed if not ports.get(p))
+    if unpublished:
+        rows.append(("Declared ports", ", ".join(unpublished) + " (no active mapping)"))
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.check_output(
+                ["/usr/libexec/ApplicationFirewall/socketfilterfw", "--getglobalstate"],
+                stderr=subprocess.DEVNULL, timeout=2, text=True).strip()
+        except (OSError, subprocess.SubprocessError):
+            result = "status unavailable"
+        rows.append(("Mac app firewall", result))
+    return rows
+
+
+def safe_text(value):
+    return "".join(ch if ch.isprintable() else ascii(ch)[1:-1] for ch in value)
+
+
+def cell_width(char):
+    if unicodedata.category(char) in ("Mn", "Me"):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
+
+
+def wrap_cells(text, width):
+    """Wrap on spaces when possible, including long paths and wide characters."""
+    while text:
+        used = 0
+        cut = 0
+        for char in text:
+            used += cell_width(char)
+            if used > width:
+                break
+            cut += 1
+        if cut == len(text):
+            yield text
+            return
+        cut = max(1, cut)
+        space = text.rfind(" ", 1, cut + 1)
+        if space > 0:
+            cut = space
+        yield text[:cut].rstrip()
+        text = text[cut:].lstrip()
+
+
+def render(header, sections, resources):
+    out = sys.stdout
+    tty = out.isatty()
+    screen = max(1, shutil.get_terminal_size((80, 24)).columns) if tty else 80
+    color = tty and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
+    encoding = out.encoding or "utf-8"
+    rule = "─" if encoding.lower().replace("-", "") == "utf8" else "-"
+
+    def paint(text, style):
+        return f"\033[{style}m{text}\033[0m" if color and style else text
+
+    def measure(value):
+        return sum(map(cell_width, value))
+
+    groups = [[("Container", header["name"], header["status"]),
+               ("Image", header["image"], header["id"][:12])]]
+    if header["health"]:
+        groups[0].append(("Health", header["health"]))
+    if header["restarts"]:
+        groups[0].append(("Restarts", str(header["restarts"])))
+
+    details = []
+    for group in ("network", "storage", "access"):
+        for label, value, *tail in sections.get(group, []):
+            if label == "Published":
+                label = "Published ports"
+                if value == "none active":
+                    value = "None"
+            elif label == "Mac app firewall":
+                known = {"Firewall is disabled. (State = 0)": "Off",
+                         "Firewall is enabled. (State = 1)": "On",
+                         "Firewall is set to block all non-essential incoming connections. (State = 2)":
+                             "Block non-essential incoming"}
+                value = known.get(value, value)
+            details.append((label, value, *tail))
+    if details:
+        groups.append(details)
+    if resources:
+        sample = resources["sample"]
+        metrics = [("Resource", "In use", "Limit") if sample else ("Resource", "Limit")]
+        pids = resources["pids"]
+        limits = [resources["cpu"] or "Uncapped", resources["memory"] or "Uncapped",
+                  str(pids) if (pids or 0) > 0 else ("Unlimited" if pids == -1 else "Default")]
+        for index, label in enumerate(("CPU", "Memory", "PIDs")):
+            values = [label]
+            if sample:
+                usage = sample[index]
+                if label == "Memory":
+                    usage = re.sub(r"(?<=\d)(?=[KMGTPE]?i?B$)", " ", usage)
+                values.append(usage)
+            metrics.append((*values, limits[index]))
+        if resources["cpuset"]:
+            metrics.append(("Allowed CPUs", resources["cpuset"]))
+        if resources["message"]:
+            metrics.append(("Usage", resources["message"]))
+        groups.append(metrics)
+
+    # Size one grid for the entire report. Two-cell rows span the last two columns.
+    groups = [[[safe_text(cell).encode(encoding, "backslashreplace").decode(encoding)
+                for cell in row] for row in group] for group in groups]
+    rows = [row for group in groups for row in group]
+    gap = 3
+    first = max(measure(row[0]) for row in rows)
+    second = max(measure(row[1]) for row in rows if len(row) == 3)
+    if tty:
+        second = min(second, max(10, (screen - first - 2 * gap) // 2))
+    third_start = first + second + 2 * gap
+    compact = tty and screen - third_start < 14
+    extent = max(max(third_start + measure(row[2]) for row in rows if len(row) == 3),
+                 max(first + gap + measure(row[1]) for row in rows))
+    line_width = min(extent, screen) if tty else extent
+    wide_lengths = (first, second, max(1, line_width - third_start))
+    stacked = compact and screen - first - gap < 14
+    for group_index, group in enumerate(groups):
+        if group_index:
+            print()
+        for row in group:
+            label, value, *tail = row
+            if compact and tail:
+                # Give each metric its headings when the third column folds away.
+                if label == "Resource":
+                    row = [label, "In use / Limit"]
+                elif label in ("CPU", "Memory", "PIDs"):
+                    row = [label, value + " / " + tail[0]]
+                else:
+                    row = [label, "  ".join(row[1:]).rstrip()]
+            styles = ["1;36" if label == "Resource" else "36", "", ""]
+            if label == "Container":
+                styles[1] = "1"
+                styles[2] = {"running": "32", "dead": "31", "restarting": "33",
+                             "paused": "33"}.get(header["status"], "")
+            elif label == "Resource":
+                styles = ["1;36"] * 3
+            if stacked:
+                for i, text in enumerate(row):
+                    indent = "  " if i and screen > 3 else ""
+                    for part in wrap_cells(text, screen - len(indent)):
+                        print(indent + paint(part, styles[i]))
+            else:
+                lengths = wide_lengths if len(row) == 3 else (first, max(1, line_width - first - gap))
+                columns = [list(wrap_cells(text, length)) if tty else [text]
+                           for text, length in zip(row, lengths)]
+                for line_index in range(max(map(len, columns))):
+                    pieces = []
+                    for i, col in enumerate(columns):
+                        part = col[line_index] if line_index < len(col) else ""
+                        styled = paint(part, styles[i]) if part else ""
+                        pieces.append(styled + " " * (lengths[i] - measure(part)))
+                    print((" " * gap).join(pieces).rstrip())
+            if label == "Resource":
+                print(paint(rule * line_width, "2"))
+
+
+def main(argv):
+    if argv == ["docker-cli-plugin-metadata"]:
+        print(json.dumps(METADATA))
+        return
+    global_flags, argv = plugin_args(argv)
+    parser = argparse.ArgumentParser(prog="docker lazy", description=__doc__)
+    parser.add_argument("container", help="container name or ID")
+    parser.add_argument("--only", choices=SECTIONS, help="show one section")
+    parser.add_argument("--fast", action="store_true", help="skip the live resource sample")
+    parser.add_argument("--json", action="store_true", help="write the compact report as JSON")
+    parser.add_argument("--version", action="version", version="docker lazy " + VERSION)
+    args = parser.parse_args(argv)
+    docker = [os.environ.get("DOCKER_CLI_PLUGIN_ORIGINAL_CLI_COMMAND") or "docker"] + global_flags
+    data = subprocess.check_output(docker + ["container", "inspect", "--", args.container])
+    container = json.loads(data)[0]
+    state = container["State"]
+    header = dict(name=container["Name"].lstrip("/"), id=container["Id"],
+                  image=container["Config"]["Image"], status=state["Status"],
+                  health=(state.get("Health") or {}).get("Status"), restarts=container.get("RestartCount", 0))
+    readers = dict(network=network_rows, storage=storage_rows, access=access_rows)
+    resources = None
+    sections = {}
+    for group in ([args.only] if args.only else SECTIONS):
+        if group == "resources":
+            resources = resource_snapshot(container, docker, args.fast)
+            rows = resource_rows(resources)
+        else:
+            rows = readers[group](container)
+        sections[group] = rows
+    if args.json:
+        report = {group: [dict(label=row[0], value="  ".join(filter(None, row[1:]))) for row in rows]
+                  for group, rows in sections.items()}
+        print(json.dumps(dict(container=header, sections=report), indent=2))
+    else:
+        render(header, sections, resources)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except subprocess.CalledProcessError as error:
+        sys.exit(error.returncode)
+    except FileNotFoundError as error:
+        sys.exit(f"docker lazy: command unavailable: {error.filename}")
+    except BrokenPipeError:
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)
