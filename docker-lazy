@@ -292,25 +292,168 @@ def render(header, sections, resources):
                 print(paint(rule * line_width, "2"))
 
 
+def compare_fields(container):
+    """Collect stable settings by key, leaving out live usage that always differs."""
+    host = container["HostConfig"]
+    state = container["State"]
+    overview = {"Image": container["Config"]["Image"], "Status": state["Status"],
+                "Restarts": str(container.get("RestartCount", 0))}
+    if container.get("Image"):
+        overview["Image ID"] = container["Image"].split(":")[-1][:12]
+    if (state.get("Health") or {}).get("Status"):
+        overview["Health"] = state["Health"]["Status"]
+
+    network = {"Network mode": host.get("NetworkMode") or "default"}
+    for row in network_rows(container):
+        if row[0] == "Network":
+            network["Network " + row[1]] = row[2] or "attached"
+
+    storage = {"Mount " + mount["Destination"]: f"{row[1]}  {row[2]}"
+               for mount, row in zip(container.get("Mounts") or [], storage_rows(container))}
+
+    limits = resource_snapshot(container, [], True)
+    pids = limits["pids"]
+    resources = {"CPU limit": limits["cpu"] or "Uncapped", "Memory limit": limits["memory"] or "Uncapped",
+                 "PIDs limit": str(pids) if (pids or 0) > 0 else ("Unlimited" if pids == -1 else "Default")}
+    if limits["cpuset"]:
+        resources["Allowed CPUs"] = limits["cpuset"]
+
+    ports = container["NetworkSettings"].get("Ports") or {}
+    access = {}
+    for target in sorted(set(container["Config"].get("ExposedPorts") or {}) | set(ports)):
+        bindings = [binding(entry, target) for entry in ports.get(target) or []]
+        access["Port " + target] = ", ".join(bindings) or "not published"
+    return dict(container=overview, network=network, storage=storage, resources=resources, access=access)
+
+
+def compare(left, right, only=None):
+    left, right = compare_fields(left), compare_fields(right)
+    changes = {}
+    matching = 0
+    for group in ([only] if only else ("container",) + SECTIONS):
+        labels = dict.fromkeys([*left[group], *right[group]])
+        rows = [(label, left[group].get(label), right[group].get(label)) for label in labels]
+        different = [row for row in rows if row[1] != row[2]]
+        matching += len(rows) - len(different)
+        if different:
+            changes[group] = different
+    return changes, matching
+
+
+def render_diff(names, changes, matching):
+    out = sys.stdout
+    tty = out.isatty()
+    screen = max(1, shutil.get_terminal_size((80, 24)).columns) if tty else 80
+    color = tty and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
+    encoding = out.encoding or "utf-8"
+    rule = "─" if encoding.lower().replace("-", "") == "utf8" else "-"
+
+    def paint(text, style):
+        return f"\033[{style}m{text}\033[0m" if color and style else text
+
+    def measure(value):
+        return sum(map(cell_width, value))
+
+    def clean(value):
+        return safe_text("-" if value is None else value).encode(encoding, "backslashreplace").decode(encoding)
+
+    def lines(text, width):
+        return list(wrap_cells(text, max(1, width))) if tty else [text]
+
+    names = [clean(name) for name in names]
+    total = sum(map(len, changes.values()))
+    plural = "" if matching == 1 else "s"
+    if not total:
+        for part in lines(f"{names[0]} and {names[1]} match across {matching} field{plural}", screen):
+            print(part)
+        return
+
+    groups = [[tuple(map(clean, row)) for row in rows] for rows in changes.values()]
+    rows = [("Field", *names)] + [row for group in groups for row in group]
+    gap = 3
+    first, second, third = (max(measure(row[i]) for row in rows) for i in range(3))
+    room = screen - first - 2 * gap
+    stacked = tty and room < 20
+    if tty and not stacked and second + third > room:
+        second = min(second, max(room // 2, room - third))
+        third = room - second
+    lengths = (first, second, third)
+    styles = ("36", "31", "32")
+
+    def table_row(row, row_styles):
+        columns = [lines(text, length) for text, length in zip(row, lengths)]
+        for line_index in range(max(map(len, columns))):
+            pieces = []
+            for i, col in enumerate(columns):
+                part = col[line_index] if line_index < len(col) else ""
+                pieces.append((paint(part, row_styles[i]) if part else "") + " " * (lengths[i] - measure(part)))
+            print((" " * gap).join(pieces).rstrip())
+
+    if not stacked:
+        table_row(rows[0], ("1;36",) * 3)
+        print(paint(rule * min(sum(lengths) + 2 * gap, screen if tty else sum(lengths) + 2 * gap), "2"))
+    for group_index, group in enumerate(groups):
+        if group_index:
+            print()
+        for row in group:
+            if stacked:
+                for part in lines(row[0], screen):
+                    print(paint(part, styles[0]))
+                indent = "  " if screen > 3 else ""
+                for i in (1, 2):
+                    for part in lines(f"{names[i - 1]}: {row[i]}", screen - len(indent)):
+                        print(indent + paint(part, styles[i]))
+            else:
+                table_row(row, styles)
+    print()
+    noun = "difference" if total == 1 else "differences"
+    for part in lines(f"{total} {noun}, {matching} matching field{plural}", screen):
+        print(part)
+
+
+def header_for(container):
+    state = container["State"]
+    return dict(name=container["Name"].lstrip("/"), id=container["Id"],
+                image=container["Config"]["Image"], status=state["Status"],
+                health=(state.get("Health") or {}).get("Status"), restarts=container.get("RestartCount", 0))
+
+
 def main(argv):
     if argv == ["docker-cli-plugin-metadata"]:
         print(json.dumps(METADATA))
         return
     global_flags, argv = plugin_args(argv)
-    parser = argparse.ArgumentParser(prog="docker lazy", description=__doc__)
+    parser = argparse.ArgumentParser(prog="docker lazy", description=__doc__,
+                                     usage="docker lazy CONTAINER [options]\n"
+                                           "       docker lazy diff CONTAINER CONTAINER [--only SECTION] [--json]")
     parser.add_argument("container", help="container name or ID")
+    parser.add_argument("others", nargs="*", help=argparse.SUPPRESS)
     parser.add_argument("--only", choices=SECTIONS, help="show one section")
     parser.add_argument("--fast", action="store_true", help="skip the live resource sample")
     parser.add_argument("--json", action="store_true", help="write the compact report as JSON")
     parser.add_argument("--version", action="version", version="docker lazy " + VERSION)
-    args = parser.parse_args(argv)
+    args = parser.parse_intermixed_args(argv)
+    if args.others and args.container != "diff":
+        parser.error("unrecognized arguments: " + " ".join(args.others))
     docker = [os.environ.get("DOCKER_CLI_PLUGIN_ORIGINAL_CLI_COMMAND") or "docker"] + global_flags
+    if args.others:
+        if len(args.others) != 2:
+            parser.error("diff needs exactly two containers")
+        left, right = (json.loads(subprocess.check_output(docker + ["container", "inspect", "--", name]))[0]
+                       for name in args.others)
+        changes, matching = compare(left, right, args.only)
+        names = [container["Name"].lstrip("/") for container in (left, right)]
+        if args.json:
+            differences = {group: [dict(label=label, left=a, right=b) for label, a, b in rows]
+                           for group, rows in changes.items()}
+            print(json.dumps(dict(left=header_for(left), right=header_for(right), identical=not changes,
+                                  matching=matching, differences=differences), indent=2))
+        else:
+            render_diff(names, changes, matching)
+        return
     data = subprocess.check_output(docker + ["container", "inspect", "--", args.container])
     container = json.loads(data)[0]
-    state = container["State"]
-    header = dict(name=container["Name"].lstrip("/"), id=container["Id"],
-                  image=container["Config"]["Image"], status=state["Status"],
-                  health=(state.get("Health") or {}).get("Status"), restarts=container.get("RestartCount", 0))
+    header = header_for(container)
     readers = dict(network=network_rows, storage=storage_rows, access=access_rows)
     resources = None
     sections = {}

@@ -109,6 +109,69 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(column("Network", "172.18"), column("Resource", "Limit"))
         self.assertEqual(column("Resource", "Limit"), column("CPU", "Uncapped"))
 
+    def diff_pair(self):
+        left, right = fixture(), fixture()
+        left["Name"], right["Name"] = "/c1", "/c2"
+        left["Image"], right["Image"] = "sha256:" + "a" * 64, "sha256:" + "b" * 64
+        right["HostConfig"]["Memory"] = 67108864
+        right["Mounts"] = []
+        right["Config"]["ExposedPorts"] = {"80/tcp": {}}
+        right["NetworkSettings"]["Ports"] = {"80/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8080"}]}
+        return left, right
+
+    def test_diff_json_reports_only_changes(self):
+        left, right = self.diff_pair()
+        stdout = io.StringIO()
+        with patch("subprocess.check_output", side_effect=[json.dumps([left]), json.dumps([right])]) as call, \
+                patch("subprocess.run") as runner, contextlib.redirect_stdout(stdout):
+            cli["main"](["--context", "lazy", "lazy", "diff", "c1", "--json", "c2"])
+        runner.assert_not_called()
+        self.assertEqual(call.call_args_list[1].args[0],
+                         ["docker", "--context", "lazy", "container", "inspect", "--", "c2"])
+        report = json.loads(stdout.getvalue())
+        self.assertFalse(report["identical"])
+        self.assertEqual(list(report["differences"]), ["container", "storage", "resources", "access"])
+        rows = {row["label"]: row for group in report["differences"].values() for row in group}
+        self.assertEqual(rows["Memory limit"]["left"], "Uncapped")
+        self.assertEqual(rows["Memory limit"]["right"], "64 MiB")
+        self.assertIsNone(rows["Port 80/tcp"]["left"])
+        self.assertIsNone(rows["Mount /data"]["right"])
+        self.assertNotIn("Network dev", rows)
+
+    def test_diff_identical_and_scoped(self):
+        left, right = self.diff_pair()
+        self.assertEqual(cli["compare"](left, left)[0], {})
+        self.assertEqual(list(cli["compare"](left, right, "storage")[0]), ["storage"])
+
+    def test_diff_layout_at_multiple_widths(self):
+        left, right = self.diff_pair()
+        right["Config"]["Image"] = "registry.example/" + "image" * 15
+        changes, matching = cli["compare"](left, right)
+        for width in (32, 48, 80, 120):
+            with self.subTest(width=width):
+                stream = io.StringIO()
+                stream.isatty = lambda: True
+                with patch.dict(os.environ, COLUMNS=str(width), NO_COLOR="1"), \
+                        contextlib.redirect_stdout(stream):
+                    cli["render_diff"](["c1", "c2"], changes, matching)
+                output = stream.getvalue()
+                self.assertIn("Memory limit", output)
+                self.assertIn("differences", output)
+                for line in output.splitlines():
+                    self.assertLessEqual(sum(map(cli["cell_width"], line)), width)
+
+    def test_container_named_diff_and_argument_errors(self):
+        stdout = io.StringIO()
+        with patch("subprocess.check_output", return_value=json.dumps([fixture()])) as call, \
+                contextlib.redirect_stdout(stdout):
+            cli["main"](["lazy", "diff", "--only", "network", "--json"])
+        self.assertEqual(call.call_args.args[0][-1], "diff")
+        for args in (["lazy", "diff", "c1"], ["lazy", "diff", "c1", "c2", "c3"], ["lazy", "c1", "c2"]):
+            with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as raised:
+                cli["main"](args)
+            self.assertEqual(raised.exception.code, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
